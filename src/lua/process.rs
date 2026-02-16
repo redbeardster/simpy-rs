@@ -9,7 +9,7 @@ use super::api;
 /// Сообщения от Lua процесса к ядру симуляции
 #[derive(Debug)]
 pub enum ProcessMessage {
-    Wait(f64),
+    Wait(f64, tokio::sync::oneshot::Sender<()>),
     Request(String),
     Release(String),
     Finished,

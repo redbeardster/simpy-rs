@@ -26,15 +26,26 @@ pub fn register_api(
 
     // wait(seconds)
     let tx_wait = tx.clone();
-    let wait_fn = lua.create_function(move |_, seconds: f64| {
-        if seconds < 0.0 {
-            return Err(mlua::Error::external("wait time cannot be negative"));
+    let wait_fn = lua.create_async_function(move |_lua, seconds: f64| {
+        let tx_wait = tx_wait.clone();
+        async move {
+            if seconds < 0.0 {
+                return Err(mlua::Error::external("wait time cannot be negative"));
+            }
+
+            // Создаем канал для пробуждения
+            let (wakeup_tx, wakeup_rx) = tokio::sync::oneshot::channel();
+
+            // Отправляем сообщение с каналом пробуждения
+            tx_wait.send(ProcessMessage::Wait(seconds, wakeup_tx))
+                .map_err(|e| mlua::Error::external(format!("failed to send wait: {}", e)))?;
+
+            // Ждем сигнала пробуждения
+            wakeup_rx.await
+                .map_err(|e| mlua::Error::external(format!("wait interrupted: {}", e)))?;
+
+            Ok(Value::Nil)
         }
-
-        tx_wait.send(ProcessMessage::Wait(seconds))
-            .map_err(|e| mlua::Error::external(format!("failed to send wait: {}", e)))?;
-
-        Ok(Value::Nil)
     })?;
     globals.set("wait", wait_fn)?;
 
