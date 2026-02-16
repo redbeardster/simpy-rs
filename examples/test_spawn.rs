@@ -48,21 +48,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("▶️  Запуск симуляции...\n");
     
-    // Запускаем симуляцию в LocalSet
-    let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        sim.run(10.0).await?;
+    // Запускаем симуляцию
+    sim.run(10.0).await?;
 
-        // Выводим статистику
-        let stats = sim.get_stats().await;
-        println!("\n📊 Статистика:");
-        println!("   Время: {} сек", stats["time"]);
-        println!("   Активных процессов: {}", stats["active_processes"]);
-        
-        println!("\n✨ Тест завершен успешно!");
-
-        Ok::<(), Box<dyn std::error::Error>>(())
-    }).await?;
+    // Выводим статистику
+    let stats = sim.get_stats().await;
+    println!("\n📊 Статистика:");
+    println!("   Время: {} сек", stats["time"]);
+    println!("   Активных процессов: {}", stats["active_processes"]);
+    
+    println!("\n✨ Тест завершен успешно!");
 
     Ok(())
 }

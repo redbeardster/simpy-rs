@@ -1,8 +1,7 @@
 //! Представление Lua-процесса в симуляции
 
-use mlua::{Lua, Result as LuaResult, RegistryKey};
+use mlua::{Lua, Result as LuaResult};
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 
 use super::api;
@@ -10,7 +9,7 @@ use super::api;
 /// Сообщения от Lua процесса к ядру симуляции
 #[derive(Debug)]
 pub enum ProcessMessage {
-    Wait(f64, tokio::sync::oneshot::Sender<()>),
+    Wait(f64),
     Request(String),
     Release(String),
     Finished,
@@ -48,10 +47,9 @@ pub enum ProcessState {
 pub struct LuaProcess {
     name: String,
     lua: Lua,
-    process_func: RegistryKey,
+    coroutine_key: mlua::RegistryKey,
     state: ProcessState,
     tx: mpsc::UnboundedSender<ProcessMessage>,
-    pending_commands: Vec<LuaCommand>,
 }
 
 impl LuaProcess {
@@ -59,86 +57,103 @@ impl LuaProcess {
         name: String,
         script_content: &str,
         function_name: &str,
-        wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     ) -> LuaResult<(Self, mpsc::UnboundedReceiver<ProcessMessage>)> {
         let (process_tx, process_rx) = mpsc::unbounded_channel();
 
-        // Создаём Lua и регистрируем API
+        // Создаём Lua
         let lua = Lua::new();
         
         // Устанавливаем имя процесса в глобальной переменной
         {
             let globals = lua.globals();
             globals.set("_process_name", name.clone())?;
+            globals.set("_current_time", 0.0)?;
         }
         
-        api::register_api(&lua, process_tx.clone(), wakeup_tx)?;
+        // Регистрируем API
+        api::register_api(&lua, process_tx.clone())?;
 
         // Загружаем скрипт
         lua.load(script_content).exec()?;
 
-        // Получаем функцию процесса и сохраняем в реестр
-        let registry_key = {
+        // Создаем корутину из функции и сохраняем в registry
+        let coroutine_key = {
             let globals = lua.globals();
             let func: mlua::Function = globals.get(function_name)?;
-            lua.create_registry_value(func)?
+            let thread = lua.create_thread(func)?;
+            lua.create_registry_value(thread)?
         };
 
         Ok((
             Self {
                 name,
                 lua,
-                process_func: registry_key,
+                coroutine_key,
                 state: ProcessState::Active,
                 tx: process_tx,
-                pending_commands: Vec::new(),
             },
             process_rx,
         ))
     }
 
-    pub async fn resume(&mut self) -> LuaResult<()> {
+    /// Возобновляет выполнение корутины
+    /// Возвращает:
+    /// - Ok(true) - корутина завершена
+    /// - Ok(false) - корутина приостановлена (yield)
+    /// - Err(e) - ошибка выполнения
+    pub fn resume(&mut self) -> LuaResult<bool> {
         if self.state == ProcessState::Finished {
-            debug!("Процесс {} уже завершен", self.name);
-            return Ok(());
+            return Ok(true);
         }
 
-        // Обрабатываем ожидающие команды
-        for cmd in self.pending_commands.drain(..) {
-            match cmd {
-                LuaCommand::ResourceGranted(resource) => {
-                    let globals = self.lua.globals();
-                    let _ = globals.set("_resource_granted", resource);
+        let coroutine: mlua::Thread = self.lua.registry_value(&self.coroutine_key)?;
+        let status = coroutine.status();
+        
+        match status {
+            mlua::ThreadStatus::Resumable => {
+                // Пытаемся возобновить корутину
+                match coroutine.resume::<_, mlua::Value>(()) {
+                    Ok(_) => {
+                        // Проверяем новый статус
+                        let new_status = coroutine.status();
+                        match new_status {
+                            mlua::ThreadStatus::Resumable => {
+                                // Корутина приостановлена (yield)
+                                debug!("Процесс {} приостановлен", self.name);
+                                Ok(false)
+                            }
+                            mlua::ThreadStatus::Unresumable => {
+                                // Корутина завершилась
+                                self.state = ProcessState::Finished;
+                                let _ = self.tx.send(ProcessMessage::Finished);
+                                info!("Процесс {} завершен", self.name);
+                                Ok(true)
+                            }
+                            mlua::ThreadStatus::Error => {
+                                error!("Процесс {} завершился с ошибкой", self.name);
+                                self.state = ProcessState::Finished;
+                                Ok(true)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Ошибка в процессе {}: {}", self.name, e);
+                        self.state = ProcessState::Finished;
+                        Err(e)
+                    }
                 }
-                LuaCommand::Error(e) => {
-                    let globals = self.lua.globals();
-                    let _ = globals.set("_error", e);
-                }
-                LuaCommand::Terminate => {
-                    self.state = ProcessState::Finished;
-                    return Ok(());
-                }
-                LuaCommand::Resume => {}
             }
-        }
-
-        let func: mlua::Function = self.lua.registry_value(&self.process_func)?;
-
-        // Запускаем функцию
-        match func.call_async::<_, ()>(()).await {
-            Ok(()) => {
+            mlua::ThreadStatus::Unresumable => {
+                // Корутина уже завершена
                 self.state = ProcessState::Finished;
-                let _ = self.tx.send(ProcessMessage::Finished);
-                info!("Процесс {} завершен", self.name);
+                Ok(true)
             }
-            Err(e) => {
-                error!("Ошибка в процессе {}: {}", self.name, e);
+            mlua::ThreadStatus::Error => {
+                error!("Процесс {} в состоянии ошибки", self.name);
                 self.state = ProcessState::Finished;
-                return Err(e);
+                Ok(true)
             }
         }
-
-        Ok(())
     }
 
     pub fn state(&self) -> &ProcessState {
@@ -165,13 +180,9 @@ impl LuaProcess {
         self.state = ProcessState::Finished;
     }
 
-    pub fn push_command(&mut self, command: LuaCommand) {
-        self.pending_commands.push(command);
-    }
-
     pub fn update_time(&mut self, time: f64) -> LuaResult<()> {
         let globals = self.lua.globals();
-        globals.set("_sim_time", time)?;
+        globals.set("_current_time", time)?;
         Ok(())
     }
 }

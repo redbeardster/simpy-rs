@@ -3,7 +3,6 @@
 use mlua::Result as LuaResult;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tracing::{info, debug};
 
 use super::process::{LuaProcess, ProcessMessage, ProcessState, LuaCommand};
@@ -28,7 +27,6 @@ impl LuaEngine {
         name: String,
         script_content: &str,
         function_name: &str,
-        wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     ) -> LuaResult<()> {
         if self.processes.contains_key(&name) {
             return Err(mlua::Error::external(format!(
@@ -41,7 +39,6 @@ impl LuaEngine {
             name.clone(),
             script_content,
             function_name,
-            wakeup_tx,
         )?;
 
         self.processes.insert(name.clone(), process);
@@ -60,7 +57,6 @@ impl LuaEngine {
         &mut self,
         name: String,
         function_name: &str,
-        wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     ) -> Result<(), String> {
         if self.processes.contains_key(&name) {
             return Err(format!("Process with name '{}' already exists", name));
@@ -75,7 +71,6 @@ impl LuaEngine {
             name.clone(),
             &script_content,
             function_name,
-            wakeup_tx,
         ).map_err(|e| format!("Failed to create process: {}", e))?;
 
         self.processes.insert(name.clone(), process);
@@ -86,14 +81,11 @@ impl LuaEngine {
     }
 
     pub async fn start_process(&mut self, name: &str) -> LuaResult<()> {
+        // Просто возобновляем корутину один раз
         if let Some(process) = self.processes.get_mut(name) {
-            process.resume().await
-        } else {
-            Err(mlua::Error::external(format!(
-                "Process '{}' not found",
-                name
-            )))
+            process.resume()?;
         }
+        Ok(())
     }
 
     pub async fn process_messages(&mut self) -> Vec<(String, ProcessMessage)> {
@@ -123,9 +115,10 @@ impl LuaEngine {
         }
     }
 
-    pub fn send_command(&mut self, process_name: &str, command: LuaCommand) -> Result<(), String> {
-        if let Some(process) = self.processes.get_mut(process_name) {
-            process.push_command(command);
+    pub fn send_command(&mut self, process_name: &str, _command: LuaCommand) -> Result<(), String> {
+        if self.processes.contains_key(process_name) {
+            // Команды больше не используются с корутинами
+            // Процессы возобновляются через ready_queue
             Ok(())
         } else {
             Err(format!("Process '{}' not found", process_name))
@@ -167,6 +160,10 @@ impl LuaEngine {
         for process in self.processes.values_mut() {
             let _ = process.update_time(time);
         }
+    }
+
+    pub fn get_process_mut(&mut self, name: &str) -> Option<&mut LuaProcess> {
+        self.processes.get_mut(name)
     }
 }
 

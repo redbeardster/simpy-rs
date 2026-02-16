@@ -2,7 +2,6 @@
 
 use mlua::{Lua, Result, Value};
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tracing::debug;
 
 use super::process::{ProcessMessage, LogLevel};
@@ -11,45 +10,42 @@ use super::process::{ProcessMessage, LogLevel};
 pub fn register_api(
     lua: &Lua,
     tx: mpsc::UnboundedSender<ProcessMessage>,
-    _wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
 ) -> Result<()> {
     let globals = lua.globals();
 
     // Инициализируем переменную времени
-    globals.set("_sim_time", 0.0)?;
+    globals.set("_current_time", 0.0)?;
 
     // now() - получить текущее время симуляции
     let now_fn = lua.create_function(|lua, ()| {
         let globals = lua.globals();
-        let time: f64 = globals.get("_sim_time")?;
+        let time: f64 = globals.get("_current_time")?;
         Ok(time)
     })?;
     globals.set("now", now_fn)?;
 
-    // wait(seconds)
+    // _rust_wait_start(seconds) - внутренняя функция для начала ожидания
     let tx_wait = tx.clone();
-    let wait_fn = lua.create_async_function(move |_lua, seconds: f64| {
-        let tx_wait = tx_wait.clone();
-        async move {
-            if seconds < 0.0 {
-                return Err(mlua::Error::external("wait time cannot be negative"));
-            }
-
-            // Создаем канал для пробуждения
-            let (wakeup_tx, wakeup_rx) = oneshot::channel();
-
-            // Отправляем сообщение с каналом пробуждения
-            tx_wait.send(ProcessMessage::Wait(seconds, wakeup_tx))
-                .map_err(|e| mlua::Error::external(format!("failed to send wait: {}", e)))?;
-
-            // Ждем сигнала пробуждения
-            wakeup_rx.await
-                .map_err(|e| mlua::Error::external(format!("wait interrupted: {}", e)))?;
-
-            Ok(Value::Nil)
+    let wait_start_fn = lua.create_function(move |_, seconds: f64| {
+        if seconds < 0.0 {
+            return Err(mlua::Error::external("wait time cannot be negative"));
         }
+
+        // Отправляем сообщение о wait
+        tx_wait.send(ProcessMessage::Wait(seconds))
+            .map_err(|e| mlua::Error::external(format!("failed to send wait: {}", e)))?;
+
+        Ok(())
     })?;
-    globals.set("wait", wait_fn)?;
+    globals.set("_rust_wait_start", wait_start_fn)?;
+
+    // Определяем wait в Lua - она вызывает _rust_wait_start и делает yield
+    lua.load(r#"
+        function wait(seconds)
+            _rust_wait_start(seconds)
+            coroutine.yield()
+        end
+    "#).exec()?;
 
     // request(resource)
     let tx_request = tx.clone();

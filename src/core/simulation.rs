@@ -29,6 +29,12 @@ impl Simulation {
         *self.current_time.lock().await
     }
 
+    pub async fn set_time(&self, time: SimTime) {
+        let mut current = self.current_time.lock().await;
+        *current = time;
+    }
+
+
     pub async fn schedule_after<F>(
         &self,
         delay: Duration,
