@@ -2,6 +2,7 @@
 
 use mlua::{Lua, Result, Value};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::debug;
 
 use super::process::{ProcessMessage, LogLevel};
@@ -10,6 +11,7 @@ use super::process::{ProcessMessage, LogLevel};
 pub fn register_api(
     lua: &Lua,
     tx: mpsc::UnboundedSender<ProcessMessage>,
+    _wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
 ) -> Result<()> {
     let globals = lua.globals();
 
@@ -34,7 +36,7 @@ pub fn register_api(
             }
 
             // Создаем канал для пробуждения
-            let (wakeup_tx, wakeup_rx) = tokio::sync::oneshot::channel();
+            let (wakeup_tx, wakeup_rx) = oneshot::channel();
 
             // Отправляем сообщение с каналом пробуждения
             tx_wait.send(ProcessMessage::Wait(seconds, wakeup_tx))

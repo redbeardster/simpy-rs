@@ -7,6 +7,8 @@ use crate::SimError;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::{info, debug, warn, error};
 use serde_json::json;
 
@@ -16,16 +18,23 @@ pub struct Simulator {
     resources: Arc<Mutex<ResourceManager>>,
     waiting_processes: Arc<Mutex<Vec<(String, String)>>>,
     resume_queue: Arc<Mutex<Vec<String>>>,
+    // Каналы для пробуждения процессов
+    wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    wakeup_rx: Arc<Mutex<mpsc::UnboundedReceiver<oneshot::Sender<()>>>>,
 }
 
 impl Simulator {
     pub fn new() -> Self {
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        
         Self {
             simulation: Arc::new(Mutex::new(Simulation::new())),
             lua_engine: Arc::new(Mutex::new(LuaEngine::new())),
             resources: Arc::new(Mutex::new(ResourceManager::new())),
             waiting_processes: Arc::new(Mutex::new(Vec::new())),
             resume_queue: Arc::new(Mutex::new(Vec::new())),
+            wakeup_tx,
+            wakeup_rx: Arc::new(Mutex::new(wakeup_rx)),
         }
     }
 
@@ -36,7 +45,7 @@ impl Simulator {
         function: &str,
     ) -> Result<(), SimError> {
         let mut engine = self.lua_engine.lock().await;
-        engine.create_process(name.to_string(), script, function)?;
+        engine.create_process(name.to_string(), script, function, self.wakeup_tx.clone())?;
         Ok(())
     }
 
@@ -54,56 +63,62 @@ impl Simulator {
         let end_time = SimTime::new(start_time.as_seconds() + duration);
         drop(sim);
 
-        // Создаем LocalSet для запуска !Send задач
-        let local = tokio::task::LocalSet::new();
-        
-        // Запускаем все процессы в LocalSet
+        // Запускаем все процессы в фоне
         {
-            let engine = self.lua_engine.clone();
-            let processes: Vec<String> = {
-                let eng = engine.lock().await;
-                eng.active_processes()
-            };
+            let engine = self.lua_engine.lock().await;
+            let processes: Vec<String> = engine.active_processes();
+            drop(engine);
+            
+            info!("Запуск {} процессов", processes.len());
             
             for name in processes {
-                let engine_clone = engine.clone();
-                local.spawn_local(async move {
+                let engine_clone = self.lua_engine.clone();
+                let proc_name = name.clone();
+                
+                info!("Создание задачи для процесса {}", proc_name);
+                
+                // Запускаем процесс в фоне
+                tokio::task::spawn_local(async move {
+                    info!("Задача для процесса {} запущена", proc_name);
                     let mut eng = engine_clone.lock().await;
-                    if let Err(e) = eng.start_process(&name).await {
-                        warn!("Не удалось запустить процесс {}: {}", name, e);
+                    info!("Процесс {} получил блокировку engine", proc_name);
+                    if let Err(e) = eng.start_process(&proc_name).await {
+                        warn!("Не удалось запустить процесс {}: {}", proc_name, e);
                     }
                 });
             }
         }
 
-        // Запускаем основной цикл симуляции внутри LocalSet
-        local.run_until(async {
-            while self.now().await < end_time {
-                // Обновляем время в Lua процессах
-                {
-                    let current_time = self.now().await;
-                    let mut engine = self.lua_engine.lock().await;
-                    engine.update_time(current_time.as_seconds());
-                }
+        // Основной цикл симуляции
+        while self.now().await < end_time {
+            // Обрабатываем пробуждения
+            self.process_wakeups().await;
 
-                let sim = self.simulation.lock().await;
-                let has_events = sim.has_events().await;
-                drop(sim);
+            // Обрабатываем сообщения от Lua процессов
+            self.process_lua_messages().await?;
 
-                if has_events {
-                    let sim = self.simulation.lock().await;
-                    sim.process_next_event().await?;
-                } else {
-                    // Даем возможность выполниться другим задачам
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                }
+            // Обновляем время в Lua процессах
+            {
+                let current_time = self.now().await;
+                let mut engine = self.lua_engine.lock().await;
+                engine.update_time(current_time.as_seconds());
             }
 
-            info!("Симуляция завершена. Время: {}", self.now().await);
-            Ok::<(), SimError>(())
-        }).await?;
+            let sim = self.simulation.lock().await;
+            let has_events = sim.has_events().await;
+            drop(sim);
 
+            if has_events {
+                let sim = self.simulation.lock().await;
+                sim.process_next_event().await?;
+            } else {
+                // Даем возможность выполниться другим задачам
+                tokio::task::yield_now().await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        info!("Симуляция завершена. Время: {}", self.now().await);
         Ok(())
     }
 
@@ -119,24 +134,24 @@ impl Simulator {
 
         for (process_name, message) in messages {
             match message {
-                ProcessMessage::Wait(seconds, wakeup_sender) => {
+                ProcessMessage::Wait(seconds, wake_sender) => {
                     debug!("Процесс {} ждет {} сек", process_name, seconds);
 
                     let mut engine = self.lua_engine.lock().await;
                     engine.set_process_waiting(&process_name, seconds);
                     drop(engine);
 
-                    let proc_name = process_name.clone();
+                    let wakeup_tx = self.wakeup_tx.clone();
                     let sim = self.simulation.lock().await;
                     sim.schedule_after(
                         Duration::from_seconds(seconds),
                         Priority::Normal,
                         move || {
-                            // Отправляем сигнал пробуждения
-                            if wakeup_sender.send(()).is_err() {
-                                error!("Не удалось разбудить процесс {}: получатель отпал", proc_name);
+                            // Отправляем сигнал пробуждения через канал
+                            if wakeup_tx.send(wake_sender).is_err() {
+                                error!("Не удалось отправить сигнал пробуждения");
                             }
-                            debug!("Процесс {} пробужден", proc_name);
+                            debug!("Сигнал пробуждения отправлен");
                         },
                     ).await?;
                 }
@@ -186,7 +201,7 @@ impl Simulator {
                     info!("Процесс {} создает новый процесс {} (функция: {})", process_name, name, func);
                     
                     let mut engine = self.lua_engine.lock().await;
-                    match engine.spawn_process(name.clone(), &func) {
+                    match engine.spawn_process(name.clone(), &func, self.wakeup_tx.clone()) {
                         Ok(()) => {
                             // Обновляем время в новом процессе
                             let current_time = self.now().await;
@@ -243,6 +258,16 @@ impl Simulator {
         }
 
         Ok(())
+    }
+
+    async fn process_wakeups(&self) {
+        let mut rx = self.wakeup_rx.lock().await;
+        while let Ok(sender) = rx.try_recv() {
+            debug!("Отправка сигнала пробуждения");
+            if sender.send(()).is_err() {
+                error!("Не удалось разбудить процесс: получатель отпал");
+            }
+        }
     }
 
     pub async fn get_stats(&self) -> serde_json::Value {

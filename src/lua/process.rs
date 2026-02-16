@@ -2,6 +2,7 @@
 
 use mlua::{Lua, Result as LuaResult, RegistryKey};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 
 use super::api;
@@ -58,12 +59,20 @@ impl LuaProcess {
         name: String,
         script_content: &str,
         function_name: &str,
+        wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     ) -> LuaResult<(Self, mpsc::UnboundedReceiver<ProcessMessage>)> {
         let (process_tx, process_rx) = mpsc::unbounded_channel();
 
         // Создаём Lua и регистрируем API
         let lua = Lua::new();
-        api::register_api(&lua, process_tx.clone())?;
+        
+        // Устанавливаем имя процесса в глобальной переменной
+        {
+            let globals = lua.globals();
+            globals.set("_process_name", name.clone())?;
+        }
+        
+        api::register_api(&lua, process_tx.clone(), wakeup_tx)?;
 
         // Загружаем скрипт
         lua.load(script_content).exec()?;

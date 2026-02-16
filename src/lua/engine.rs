@@ -3,6 +3,7 @@
 use mlua::Result as LuaResult;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::{info, debug};
 
 use super::process::{LuaProcess, ProcessMessage, ProcessState, LuaCommand};
@@ -27,6 +28,7 @@ impl LuaEngine {
         name: String,
         script_content: &str,
         function_name: &str,
+        wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     ) -> LuaResult<()> {
         if self.processes.contains_key(&name) {
             return Err(mlua::Error::external(format!(
@@ -39,6 +41,7 @@ impl LuaEngine {
             name.clone(),
             script_content,
             function_name,
+            wakeup_tx,
         )?;
 
         self.processes.insert(name.clone(), process);
@@ -57,6 +60,7 @@ impl LuaEngine {
         &mut self,
         name: String,
         function_name: &str,
+        wakeup_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     ) -> Result<(), String> {
         if self.processes.contains_key(&name) {
             return Err(format!("Process with name '{}' already exists", name));
@@ -71,6 +75,7 @@ impl LuaEngine {
             name.clone(),
             &script_content,
             function_name,
+            wakeup_tx,
         ).map_err(|e| format!("Failed to create process: {}", e))?;
 
         self.processes.insert(name.clone(), process);
